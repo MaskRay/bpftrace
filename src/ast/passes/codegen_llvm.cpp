@@ -8,10 +8,12 @@
 #include <fstream>
 
 #include <llvm-c/Transforms/IPO.h>
+#include <llvm/Analysis/AliasAnalysis.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Metadata.h>
+#include <llvm/Passes/PassBuilder.h>
 #include <llvm/Transforms/IPO.h>
 #include <llvm/Transforms/IPO/PassManagerBuilder.h>
 
@@ -3107,6 +3109,51 @@ void CodegenLLVM::emit_elf(const std::string &filename)
 void CodegenLLVM::optimize()
 {
   assert(state_ == State::IR);
+
+#if LLVM_VERSION_MAJOR >= 12
+  PipelineTuningOptions pto;
+  pto.LoopUnrolling = false;
+  pto.LoopInterleaving = false;
+  pto.LoopVectorization = false;
+  pto.SLPVectorization = false;
+
+  auto &tm = orc_->getTargetMachine();
+#if LLVM_VERSION_MAJOR >= 14
+  llvm::PassBuilder pb(&tm, pto);
+#else
+  llvm::PassBuilder pb(/*DebugLogging=*/false, &tm, pto);
+#endif
+
+  // ModuleAnalysisManager must be destroyed first.
+  llvm::LoopAnalysisManager lam;
+  llvm::FunctionAnalysisManager fam;
+  llvm::CGSCCAnalysisManager cgam;
+  llvm::ModuleAnalysisManager mam;
+
+#if LLVM_VERSION_MAJOR < 14
+  // This is the default since LLVM 14.
+  llvm::AAManager aa = pb.buildDefaultAAPipeline();
+  fam.registerPass([&] { return std::move(aa); });
+#endif
+
+  // Register all the basic analyses with the managers.
+  pb.registerModuleAnalyses(mam);
+  pb.registerCGSCCAnalyses(cgam);
+  pb.registerFunctionAnalyses(fam);
+  pb.registerLoopAnalyses(lam);
+  pb.crossRegisterProxies(lam, fam, cgam, mam);
+
+  ModulePassManager mpm;
+#if LLVM_VERSION_MAJOR >= 14
+  using OptimizationLevel = llvm::OptimizationLevel;
+#else
+  using OptimizationLevel = PassBuilder::OptimizationLevel;
+#endif
+  mpm = pb.buildPerModuleDefaultPipeline(OptimizationLevel::O3,
+                                         /*LTOPreLink=*/false);
+  mpm.run(*module_, mam);
+
+#else
   PassManagerBuilder PMB;
   PMB.OptLevel = 3;
   legacy::PassManager PM;
@@ -3122,6 +3169,8 @@ void CodegenLLVM::optimize()
   PMB.populateModulePassManager(PM);
 
   PM.run(*module_.get());
+#endif
+
   state_ = State::OPT;
 }
 
